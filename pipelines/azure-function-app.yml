@@ -1,0 +1,364 @@
+# Azure DevOps YAML Pipeline for BOIHub Function Apps
+# This template provides a complete CI/CD pipeline for Azure Function Apps with Bicep infrastructure deployment
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - release/*
+  paths:
+    include:
+    - src/*
+    - bicep/*
+    - pipelines/*
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - src/*
+    - bicep/*
+    - pipelines/*
+
+variables:
+  # Build Configuration
+  buildConfiguration: 'Release'
+  dotNetFramework: 'net6.0'
+  dotNetVersion: '6.0.x'
+  
+  # Azure Configuration
+  azureSubscription: 'BOIHub-ServiceConnection'
+  resourceGroupPrefix: 'rg-boihub'
+  
+  # Pipeline Configuration
+  vmImageName: 'ubuntu-latest'
+  
+  # Compliance and Security
+  enableCodeAnalysis: true
+  enableSecurityScan: true
+  enableComplianceCheck: true
+
+# Variable groups for different environments
+variables:
+- group: 'BOIHub-Dev-Variables'
+- group: 'BOIHub-Test-Variables'
+- group: 'BOIHub-Prod-Variables'
+
+stages:
+- stage: 'Validate'
+  displayName: 'Validate and Build'
+  jobs:
+  - job: 'ValidateCode'
+    displayName: 'Code Validation and Analysis'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - checkout: self
+      fetchDepth: 0
+    
+    - task: UseDotNet@2
+      displayName: 'Install .NET SDK'
+      inputs:
+        packageType: 'sdk'
+        version: $(dotNetVersion)
+        includePreviewVersions: false
+    
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet Packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+        feedsToUse: 'select'
+        verbosityRestore: 'Minimal'
+    
+    - task: DotNetCoreCLI@2
+      displayName: 'Build Solution'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+    
+    - task: DotNetCoreCLI@2
+      displayName: 'Run Unit Tests'
+      inputs:
+        command: 'test'
+        projects: '**/*Tests*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage" --results-directory $(Agent.TempDirectory)/TestResults'
+        publishTestResults: true
+    
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish Code Coverage'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/TestResults/*/coverage.cobertura.xml'
+    
+    # Security and Compliance Scanning
+    - task: CredScan@3
+      displayName: 'Run Credential Scanner'
+      condition: eq(variables.enableSecurityScan, true)
+      inputs:
+        toolMajorVersion: 'V2'
+        scanFolder: '$(Build.SourcesDirectory)'
+        debugMode: false
+    
+    - task: SonarCloudPrepare@1
+      displayName: 'Prepare SonarCloud Analysis'
+      condition: eq(variables.enableCodeAnalysis, true)
+      inputs:
+        SonarCloud: 'SonarCloud-ServiceConnection'
+        organization: 'boihub'
+        scannerMode: 'MSBuild'
+        projectKey: 'BOIHub_FunctionApps'
+        projectName: 'BOIHub Function Apps'
+    
+    - task: SonarCloudAnalyze@1
+      displayName: 'Run SonarCloud Analysis'
+      condition: eq(variables.enableCodeAnalysis, true)
+    
+    - task: SonarCloudPublish@1
+      displayName: 'Publish SonarCloud Results'
+      condition: eq(variables.enableCodeAnalysis, true)
+      inputs:
+        pollingTimeoutSec: '300'
+
+  - job: 'ValidateBicep'
+    displayName: 'Bicep Template Validation'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - checkout: self
+    
+    - task: AzureCLI@2
+      displayName: 'Install Bicep CLI'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az bicep install
+          az bicep version
+    
+    - task: AzureCLI@2
+      displayName: 'Validate Bicep Templates'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Validating Bicep templates..."
+          
+          # Validate main template
+          az deployment group validate \
+            --resource-group $(resourceGroupPrefix)-dev \
+            --template-file bicep/main.bicep \
+            --parameters environment=dev projectName=boihub
+          
+          # Validate individual modules
+          for module in bicep/modules/*.bicep; do
+            echo "Validating $module"
+            az bicep build --file "$module"
+          done
+    
+    - task: AzureCLI@2
+      displayName: 'Bicep Linting and Best Practices'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Run Bicep linter
+          az bicep build --file bicep/main.bicep
+          
+          # Check for security best practices
+          echo "Checking for In Control compliance..."
+          
+          # Verify TLS 1.2 enforcement
+          grep -r "minTlsVersion.*1\.2" bicep/ || (echo "ERROR: TLS 1.2 not enforced" && exit 1)
+          
+          # Verify HTTPS only
+          grep -r "httpsOnly.*true" bicep/ || (echo "ERROR: HTTPS not enforced" && exit 1)
+          
+          echo "Bicep templates pass compliance checks"
+
+- stage: 'BuildAndPackage'
+  displayName: 'Build and Package'
+  dependsOn: 'Validate'
+  condition: succeeded()
+  jobs:
+  - job: 'BuildFunctionApps'
+    displayName: 'Build Function Apps'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - checkout: self
+    
+    - task: UseDotNet@2
+      displayName: 'Install .NET SDK'
+      inputs:
+        packageType: 'sdk'
+        version: $(dotNetVersion)
+    
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore Packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+    
+    - task: DotNetCoreCLI@2
+      displayName: 'Build and Publish Function Apps'
+      inputs:
+        command: 'publish'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/functionapps --no-restore'
+        zipAfterPublish: true
+        modifyOutputPath: false
+    
+    - task: CopyFiles@2
+      displayName: 'Copy Bicep Templates'
+      inputs:
+        SourceFolder: 'bicep'
+        Contents: '**/*'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/bicep'
+    
+    - task: CopyFiles@2
+      displayName: 'Copy Pipeline Scripts'
+      inputs:
+        SourceFolder: 'scripts'
+        Contents: '**/*'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/scripts'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: 'DeployDev'
+  displayName: 'Deploy to Development'
+  dependsOn: 'BuildAndPackage'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  variables:
+  - group: 'BOIHub-Dev-Variables'
+  - name: 'environmentName'
+    value: 'dev'
+  jobs:
+  - deployment: 'DeployInfrastructure'
+    displayName: 'Deploy Infrastructure'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'BOIHub-Dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          
+          - task: AzureCLI@2
+            displayName: 'Deploy Bicep Infrastructure'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Create resource group if it doesn't exist
+                az group create \
+                  --name $(resourceGroupPrefix)-$(environmentName) \
+                  --location $(azureLocation)
+                
+                # Deploy infrastructure
+                az deployment group create \
+                  --resource-group $(resourceGroupPrefix)-$(environmentName) \
+                  --template-file $(Pipeline.Workspace)/drop/bicep/main.bicep \
+                  --parameters environment=$(environmentName) projectName=boihub \
+                  --mode Incremental \
+                  --verbose
+          
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy Function Apps'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appType: 'functionApp'
+              appName: 'boihub-$(environmentName)-webparts-api'
+              package: '$(Pipeline.Workspace)/drop/functionapps/**/*.zip'
+              deploymentMethod: 'auto'
+              appSettings: |
+                -FUNCTIONS_WORKER_RUNTIME dotnet
+                -FUNCTIONS_EXTENSION_VERSION ~4
+                -WEBSITE_RUN_FROM_PACKAGE 1
+          
+          - task: PowerShell@2
+            displayName: 'Run Compliance Validation'
+            condition: eq(variables.enableComplianceCheck, true)
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Pipeline.Workspace)/drop/scripts/validate-compliance.ps1'
+              arguments: '-ResourceGroupName $(resourceGroupPrefix)-$(environmentName) -SubscriptionId $(subscriptionId)'
+
+- stage: 'DeployTest'
+  displayName: 'Deploy to Test'
+  dependsOn: 'DeployDev'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+  - group: 'BOIHub-Test-Variables'
+  - name: 'environmentName'
+    value: 'test'
+  jobs:
+  - deployment: 'DeployToTest'
+    displayName: 'Deploy to Test Environment'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'BOIHub-Test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/deploy-infrastructure.yml
+            parameters:
+              environmentName: $(environmentName)
+              azureSubscription: $(azureSubscription)
+              resourceGroupPrefix: $(resourceGroupPrefix)
+
+- stage: 'DeployProd'
+  displayName: 'Deploy to Production'
+  dependsOn: 'DeployTest'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+  - group: 'BOIHub-Prod-Variables'
+  - name: 'environmentName'
+    value: 'prod'
+  jobs:
+  - deployment: 'DeployToProduction'
+    displayName: 'Deploy to Production Environment'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'BOIHub-Production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/deploy-infrastructure.yml
+            parameters:
+              environmentName: $(environmentName)
+              azureSubscription: $(azureSubscription)
+              resourceGroupPrefix: $(resourceGroupPrefix)
+          
+          - task: AzureCLI@2
+            displayName: 'Warm Up Function Apps'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Warm up function apps after deployment
+                functionApps=("boihub-prod-webparts-api" "boihub-prod-data-processor")
+                
+                for app in "${functionApps[@]}"; do
+                  echo "Warming up $app..."
+                  curl -f "https://$app.azurewebsites.net/api/health" || echo "Health check failed for $app"
+                done

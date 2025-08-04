@@ -1,0 +1,66 @@
+# Azure DevOps and Build artifacts
+**/*.azuredevops
+**/bin/
+**/obj/
+**/out/
+**/.vs/
+**/.vscode/
+**/TestResults/
+**/*.user
+**/*.suo
+**/*.cache
+**/*.docstates
+
+# Azure and Bicep
+**/*.deploymenttemplates
+**/bicep/compiled/
+**/.azure/
+**/parameters.local.json
+**/parameters.*.local.json
+
+# Logs and temporary files
+**/*.log
+**/logs/
+**/temp/
+**/tmp/
+**/.temp/
+**/.tmp/
+
+# Environment and secrets
+**/.env
+**/.env.local
+**/.env.*.local
+**/secrets.json
+**/appsettings.local.json
+**/local.settings.json
+
+# OS generated files
+**/Thumbs.db
+**/ehthumbs.db
+**/Desktop.ini
+**/.DS_Store
+**/.DS_Store?
+**/.Spotlight-V100
+**/.Trashes
+**/Icon?
+
+# IDE and editor files
+**/.idea/
+**/*.swp
+**/*.swo
+**/*~
+
+# Package managers
+**/node_modules/
+**/packages/
+**/.nuget/
+**/package-lock.json
+**/yarn.lock
+
+# Azure Functions
+**/local.settings.json
+**/bin
+**/obj
+
+# PowerShell
+**/PSScriptAnalyzerSettings.psd1

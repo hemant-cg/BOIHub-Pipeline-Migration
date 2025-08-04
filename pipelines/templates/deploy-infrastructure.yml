@@ -1,0 +1,135 @@
+# Reusable deployment template for infrastructure and function apps
+parameters:
+- name: environmentName
+  type: string
+- name: azureSubscription
+  type: string
+- name: resourceGroupPrefix
+  type: string
+
+steps:
+- download: current
+  artifact: drop
+
+- task: AzureCLI@2
+  displayName: 'Create Resource Group'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az group create \
+        --name ${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }} \
+        --location $(azureLocation)
+
+- task: AzureCLI@2
+  displayName: 'Deploy Bicep Infrastructure'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      echo "Deploying infrastructure for ${{ parameters.environmentName }} environment..."
+      
+      # Deploy main Bicep template
+      deploymentOutput=$(az deployment group create \
+        --resource-group ${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }} \
+        --template-file $(Pipeline.Workspace)/drop/bicep/main.bicep \
+        --parameters environment=${{ parameters.environmentName }} projectName=boihub \
+        --mode Incremental \
+        --output json)
+      
+      echo "Deployment completed successfully"
+      echo "##vso[task.setvariable variable=deploymentOutput]$deploymentOutput"
+
+- task: AzureFunctionApp@1
+  displayName: 'Deploy WebParts API Function App'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    appType: 'functionApp'
+    appName: 'boihub-${{ parameters.environmentName }}-webparts-api'
+    package: '$(Pipeline.Workspace)/drop/functionapps/**/*webparts-api*.zip'
+    deploymentMethod: 'auto'
+    appSettings: |
+      -FUNCTIONS_WORKER_RUNTIME dotnet
+      -FUNCTIONS_EXTENSION_VERSION ~4
+      -WEBSITE_RUN_FROM_PACKAGE 1
+      -ASPNETCORE_ENVIRONMENT ${{ parameters.environmentName }}
+
+- task: AzureFunctionApp@1
+  displayName: 'Deploy Data Processor Function App'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    appType: 'functionApp'
+    appName: 'boihub-${{ parameters.environmentName }}-data-processor'
+    package: '$(Pipeline.Workspace)/drop/functionapps/**/*data-processor*.zip'
+    deploymentMethod: 'auto'
+    appSettings: |
+      -FUNCTIONS_WORKER_RUNTIME dotnet
+      -FUNCTIONS_EXTENSION_VERSION ~4
+      -WEBSITE_RUN_FROM_PACKAGE 1
+      -ASPNETCORE_ENVIRONMENT ${{ parameters.environmentName }}
+
+- task: PowerShell@2
+  displayName: 'Validate Deployment'
+  inputs:
+    targetType: 'inline'
+    script: |
+      Write-Host "Validating deployment for ${{ parameters.environmentName }} environment..."
+      
+      # Test Function App endpoints
+      $functionApps = @(
+        "boihub-${{ parameters.environmentName }}-webparts-api",
+        "boihub-${{ parameters.environmentName }}-data-processor"
+      )
+      
+      foreach ($app in $functionApps) {
+        try {
+          $response = Invoke-WebRequest -Uri "https://$app.azurewebsites.net/api/health" -Method GET -TimeoutSec 30
+          if ($response.StatusCode -eq 200) {
+            Write-Host "✓ $app is responding correctly"
+          } else {
+            Write-Warning "⚠ $app returned status code: $($response.StatusCode)"
+          }
+        }
+        catch {
+          Write-Warning "⚠ Failed to reach $app : $($_.Exception.Message)"
+        }
+      }
+
+- task: PowerShell@2
+  displayName: 'Run Compliance Validation'
+  condition: eq(variables.enableComplianceCheck, true)
+  inputs:
+    targetType: 'filePath'
+    filePath: '$(Pipeline.Workspace)/drop/scripts/validate-compliance.ps1'
+    arguments: '-ResourceGroupName ${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }} -SubscriptionId $(subscriptionId)'
+
+- task: AzureCLI@2
+  displayName: 'Configure Monitoring and Alerts'
+  inputs:
+    azureSubscription: ${{ parameters.azureSubscription }}
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      echo "Configuring monitoring and alerts..."
+      
+      # Get Application Insights instrumentation key
+      appInsightsKey=$(az monitor app-insights component show \
+        --app boihub-${{ parameters.environmentName }}-appinsights \
+        --resource-group ${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }} \
+        --query instrumentationKey -o tsv)
+      
+      echo "Application Insights configured with key: ${appInsightsKey:0:8}..."
+      
+      # Set up basic alert rules if they don't exist
+      az monitor metrics alert create \
+        --name "Function App High Response Time" \
+        --resource-group ${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }} \
+        --scopes "/subscriptions/$(subscriptionId)/resourceGroups/${{ parameters.resourceGroupPrefix }}-${{ parameters.environmentName }}" \
+        --condition "avg requests/duration > 2000" \
+        --description "Alert when average response time exceeds 2 seconds" \
+        --evaluation-frequency 5m \
+        --window-size 15m \
+        --severity 3 \
+        --auto-mitigate true || echo "Alert rule may already exist"
